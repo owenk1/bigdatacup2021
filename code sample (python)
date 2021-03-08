@@ -1,0 +1,563 @@
+# Below is a non-exhaustive sample of the code I used to build my submission that's intended to highlight the approach I took. Comments are included to aid legibility.
+# Any questions or feedback is welcome.
+
+# Import relevant packages
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import statsmodels.api as sm
+from statsmodels.discrete.discrete_model import Logit
+import math
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+
+# Set display format & read in scouting data
+pd.set_option('display.float_format', lambda x: '%.3f' % x)
+input_df = pd.read_csv('hackathon_scouting.csv', index_col=0)
+
+# Establish thresholds to divide ice into zones A-L
+x_thresholds = [124.99, 146.99, 168.99, 200.01]
+y_thresholds = [-0.01, 20.5, 85/2, 64.5, 85.01]
+
+# Define function to assign a zone (A-L) based on coordinates
+def find_zone(df, xcord_str, ycord_str):
+    if (y_thresholds[3] < df[ycord_str] < y_thresholds[4]) & (x_thresholds[0] < df[xcord_str] < x_thresholds[1]):
+        return 'A'
+    elif (y_thresholds[3] < df[ycord_str] < y_thresholds[4]) & (x_thresholds[1] < df[xcord_str] < x_thresholds[2]):
+        return 'B'
+    elif (y_thresholds[3] < df[ycord_str] < y_thresholds[4]) & (x_thresholds[2] < df[xcord_str] < x_thresholds[3]):
+        return 'C'
+    elif (y_thresholds[2] < df[ycord_str] < y_thresholds[3]) & (x_thresholds[0] < df[xcord_str] < x_thresholds[1]):
+        return 'D'
+    elif (y_thresholds[2] < df[ycord_str] < y_thresholds[3]) & (x_thresholds[1] < df[xcord_str] < x_thresholds[2]):
+        return 'E'
+    elif (y_thresholds[2] < df[ycord_str] < y_thresholds[3]) & (x_thresholds[2] < df[xcord_str] < x_thresholds[3]):
+        return 'F'
+    elif (y_thresholds[1] < df[ycord_str] < y_thresholds[2]) & (x_thresholds[0] < df[xcord_str] < x_thresholds[1]):
+        return 'G'
+    elif (y_thresholds[1] < df[ycord_str] < y_thresholds[2]) & (x_thresholds[1] < df[xcord_str] < x_thresholds[2]):
+        return 'H'
+    elif (y_thresholds[1] < df[ycord_str] < y_thresholds[2]) & (x_thresholds[2] < df[xcord_str] < x_thresholds[3]):
+        return 'I'
+    elif (y_thresholds[0] < df[ycord_str] < y_thresholds[1]) & (x_thresholds[0] < df[xcord_str] < x_thresholds[1]):
+        return 'J'
+    elif (y_thresholds[0] < df[ycord_str] < y_thresholds[1]) & (x_thresholds[1] < df[xcord_str] < x_thresholds[2]):
+        return 'K'
+    elif (y_thresholds[0] < df[ycord_str] < y_thresholds[1]) & (x_thresholds[2] < df[xcord_str] < x_thresholds[3]):
+        return 'L'
+    else:
+        return 'NA'
+    
+# Look up zones for primary & secondary events
+input_df['Coordinate Zone'] = input_df.apply(lambda x: find_zone(x, 'X Coordinate', 'Y Coordinate'), axis=1)
+input_df['Coordinate Zone 2'] = input_df.apply(lambda x: find_zone(x, 'X Coordinate 2', 'Y Coordinate 2'), axis=1)
+input_df['Coordinate Zones'] = input_df['Coordinate Zone'] + input_df['Coordinate Zone 2']
+
+# Create dictionaries to look up event details (and next-event details) by index 
+index_event_dict = dict(zip(input_df.index, input_df['Event']))
+index_detail_1_dict = dict(zip(input_df.index, input_df['Detail 1']))
+index_x_cord_dict = dict(zip(input_df.index, input_df['X Coordinate'])) 
+index_y_cord_dict = dict(zip(input_df.index, input_df['Y Coordinate'])) 
+index_cord_zone_dict = dict(zip(input_df.index, input_df['Coordinate Zone'])) 
+index_x_cord2_dict = dict(zip(input_df.index, input_df['X Coordinate 2'])) 
+index_y_cord2_dict = dict(zip(input_df.index, input_df['Y Coordinate 2'])) 
+index_cord_zone_2_dict = dict(zip(input_df.index, input_df['Coordinate Zone 2']))
+
+# Example function to look up details of previous event - a different function was defined for each dictionary above
+def lookup_previous_event_type(df):
+    if df.index == 0:
+        return 'NA'
+    else:
+        return index_event_dict[df.index - 1] #index-1 is previous event's index
+
+# Apply function to populate event details
+input_df['Previous Event'] = input_df.apply(lookup_previous_event_type, axis=1)
+
+# Convert categorical data to binary dummies (a column with 0 or 1 for each previous event option)
+input_df = pd.get_dummies(input_df, columns=['Previous Event'])
+
+# Transform model inputs & target so they are binary
+input_df['On Net'] = input_df['Detail 2'].map({'On Net': 1, 'Missed': 0, 'Blocked': 0})
+input_df['Traffic'] = input_df['Detail 3'].map({'f': 0, 't': 1})
+input_df['One Timer'] = input_df['Detail 4'].map({'f': 0, 't': 1})
+input_df['Goal'] = input_df['Event'].map({'Shot': 0, 'Goal': 1})
+
+# Define functions to calculate additional features for each shot attempt (distance, angle, game state)
+def calculate_shot_distance(df):
+    cords = np.array((df['X Coordinate'], df['Y Coordinate']))
+    net = np.array((189, 42.5))
+    return np.linalg.norm(cords-net)
+
+def calculate_shot_angle(df):
+    angle_radians = math.atan2(42.5-df['Y Coordinate'], 189-df['X Coordinate'])
+    return min(math.degrees(angle_radians)+90, 90-math.degrees(angle_radians)) 
+
+def determine_game_state(df):
+    if df['Team'] == df['Home Team']:
+        event_team_skaters = df['Home Team Skaters']
+        other_team_skaters = df['Away Team Skaters']
+    elif df['Team'] == df['Away Team']:
+        event_team_skaters = df['Away Team Skaters']
+        other_team_skaters = df['Home Team Skaters']   
+    if event_team_skaters > other_team_skaters:
+        return 'PP'
+    elif event_team_skaters == other_team_skaters:
+        return 'ES'
+    elif event_team_skaters < other_team_skaters:
+        return 'SH'
+
+# Filter data to create dataframe where each row is a shot attempt, then apply functions to calculate additional features  
+all_shot_df = input_df.copy()
+all_shot_df = all_shot_df.loc[(all_shot_df['Event'] == 'Shot') | (all_shot_df['Event'] == 'Goal')]
+all_shot_df['Shot Distance'] = all_shot_df.apply(calculate_shot_distance, axis=1)
+all_shot_df['Shot Angle'] = all_shot_df.apply(calculate_shot_angle, axis=1)
+all_shot_df['Game State'] = all_shot_df.apply(determine_game_state, axis=1)
+all_shot_df['Shot Location Zone'] = all_shot_df.apply(lambda x: find_zone(x, 'X Coordinate', 'Y Coordinate'), axis=1)
+
+# Scale distance & angle to be between 0 and 1 to match the scale of binary inputs (this will help model performance)
+all_shot_df['Shot Distance'] = MinMaxScaler().fit_transform(all_shot_df[['Shot Distance']])
+all_shot_df['Shot Angle'] = MinMaxScaler().fit_transform(all_shot_df[['Shot Angle']])
+
+# Convert shot type and game state to binary dummies
+all_shot_df.rename(columns={'Detail 1': 'Shot Type'}, inplace=True)
+all_shot_df = pd.get_dummies(all_shot_df, columns=['Shot Type'])
+all_shot_df = pd.get_dummies(all_shot_df, columns=['Game State'])
+
+# Define functions to categorize pre-shot passing (only a few examples included)
+def previous_event_pass_royal_road(df):
+    if (df['Previous Event Zones'][0] in ['A','B','C','D','E','F']) & (df['Previous Event Zones'][1] in ['G', 'H', 'I', 'J', 'K', 'L']):
+        return 1
+    elif (df['Previous Event Zones'][0] in ['G','H','I','J','K','L']) & (df['Previous Event Zones'][1] in ['A', 'B', 'C', 'D', 'E', 'F']):
+        return 1
+    else:
+        return 0
+    
+def previous_event_pass_same_x_1(df):
+    return ((df['Previous Event Zones'][0] in ['A','D','G','J']) & (df['Previous Event Zones'][1] in ['A','D','G','J']))
+
+def previous_event_pass_same_y_1(df):
+    return ((df['Previous Event Zones'][0] in ['A','B','C']) & (df['Previous Event Zones'][1] in ['A','B','C']))
+
+def previous_event_pass_low_high_2_1(df):
+    return ((df['Previous Event Zones'][0] in ['B','E','H','K']) & (df['Previous Event Zones'][1] in ['A','D','G','J']))
+
+# Filter data to only include shots that follow passes (to be used for Model 1)
+pass_shot_df = all_shot_df.loc[all_shot_df['Previous Event_Play'] == 1]
+
+# Apply above functions to describe pre-shot passing
+pass_shot_df['Pass Before Royal Road'] = pass_shot_df.apply(previous_event_pass_royal_road, axis=1)
+pass_shot_df['Pass Before Same X 1'] = pass_shot_df.apply(previous_event_pass_same_x_1, axis=1)
+pass_shot_df['Pass Before Same Y 1'] = pass_shot_df.apply(previous_event_pass_same_y_1, axis=1)
+pass_shot_df['Pass Before Low High 2 1'] = pass_shot_df.apply(previous_event_pass_low_high_2_1, axis=1)
+
+# Up-level passing categorization (e.g., same x, same y, low-high, etc.)
+pass_shot_df['Pass Before Same X'] = pass_shot_df[['Pass Before Same X 1','Pass Before Same X 2','Pass Before Same X 3']].max(axis=1)
+pass_shot_df['Pass Before Same Y'] = pass_shot_df[['Pass Before Same Y 1','Pass Before Same Y 2','Pass Before Same Y 3','Pass Before Same Y 4']].max(axis=1)
+pass_shot_df['Pass Before Low High'] = pass_shot_df[['Pass Before Low High 3 2','Pass Before Low High 2 1','Pass Before Low High 3 1']].max(axis=1)
+
+#Build Model 1: Shot attempts after passes
+pass_predictors = ['Shot Distance', 'Shot Angle','Traffic', 'One Timer',
+                   'Shot Type_Slapshot','Shot Type_Snapshot','Shot Type_Wrap Around','Shot Type_Wristshot','Shot Type_Deflection',
+                   'Pass Before Cross Slot', 'Pass Before Same X', 'Pass Before Same Y','Pass Before Low High', 'Pass Before High Low']
+
+X = pass_shot_df[pass_predictors]
+y = pass_shot_df['Goal']
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=1)
+
+pass_logreg_model = Logit(y_train, X_train).fit()
+pass_shot_df['xG'] = pass_logreg_model.predict(pass_shot_df[pass_predictors])
+pass_logreg_model.summary2()
+
+# Build a ROC curve to assess model performance (code only shown once, but was also used for model 2)
+# Set discrimination thresholds
+ths = np.arange(0., 1.0, 0.025)
+
+# Containers
+sensitivity, specificity, accuracy, matthews = [], [], [], []
+
+# Main loop
+for th in ths:
+    # Generate estimates
+    conf_mat = pass_logreg_model.pred_table(threshold=th)
+    
+    # Extract TN, FP, ...
+    tn, fp, fn, tp = conf_mat.flatten()
+    
+    # Calculate sensitivity and specificity
+    sens = (1. * tp) / (tp + fn)
+    spec = (1. * tn) / (tn + fp)    
+    
+    # Calculate ACC and MCC
+    acc = (tp + tn) / np.sum(conf_mat)
+    mcc = (tp * tn - fp * fn)/np.sqrt((tp + fp)*(tp + fn)*(tn + fp)*(tn + fn))    
+
+    # Add to containers
+    sensitivity.append(sens)
+    specificity.append(spec)
+    accuracy.append(acc)
+    matthews.append(mcc)
+    
+# Bind all the numbers together
+roc = pd.DataFrame({'discret_thr' : ths, 
+                    'sensitivity' : sensitivity, 
+                    'specificity' : specificity,
+                    '_specificity' : [1 - x for x in specificity],
+                    'accuracy' : accuracy, 
+                    'matthews' : matthews})
+
+# Sort by 1 - specificity so we can plot it easily
+roc = roc.sort_values(by = "_specificity")
+
+# Plot curve
+plt.close()
+plt.plot(roc._specificity, roc.sensitivity, label = 'ROC')
+plt.plot(np.arange(0., 1., 0.01), 
+         np.arange(0., 1., 0.01), 
+         '--')
+
+plt.title('Model 1 Performance: ROC Curve', fontsize='18', y=1.05)
+plt.ylabel('True Positive Rate', fontsize=12)
+plt.xlabel('False Positive Rate', fontsize=12)
+plt.legend(loc = 4)
+auc = np.trapz(y = roc.sensitivity, x = roc._specificity)
+plt.text(1, 0.15, "Area under curve = %1.2f" % auc, color='black', fontsize=12, ha='right', va='center')
+plt.show()
+
+# Model 2: Shot attempts not after passes
+no_pass_shot_df = all_shot_df.loc[all_shot_df['Previous Event_Play'] != 1]
+no_pass_predictors = ['Shot Distance', 'Shot Angle', 'Traffic', 'One Timer',
+                      'Previous Event_Puck Recovery','Previous Event_Shot','Previous Event_Takeaway','Previous Event_Zone Entry',
+                      'Shot Type_Snapshot','Shot Type_Wristshot', 'Shot Type_Slapshot', 'Shot Type_Deflection']
+
+X = no_pass_shot_df[no_pass_predictors]
+y = no_pass_shot_df['Goal']
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=1)
+
+no_pass_logreg_model = Logit(y_train, X_train).fit()
+no_pass_shot_df['xG'] = no_pass_logreg_model.predict(no_pass_shot_df[no_pass_predictors])
+no_pass_logreg_model.summary2()
+
+# Combine model outputs & create xg dictionary to facilitate lookup by index
+shot_df = pd.concat([pass_shot_df, no_pass_shot_df], axis=0, ignore_index=True)
+xg_index_dict = dict(zip(shot_df.index, shot_df['xG']))
+
+# Now we aggregate passing data - starting by creating a dataframe where each row is a pass
+# Define lookup function
+def pass_index_function(pass_index):
+    return_dict = {}
+    pass_event = input_df.loc[pass_index,:]
+    next_event = input_df.loc[pass_index+1,:]
+    return_dict['Pass Index'] = pass_index
+    return_dict['Pass Origin'] = str(pass_event['X Coordinate']) + "_" + str(pass_event['Y Coordinate'])  
+    return_dict['Pass Origin Zone'] = pass_event['Coordinate Zone']
+    return_dict['Pass Destination'] = str(pass_event['X Coordinate 2'])[:-2] + "_" + str(pass_event['Y Coordinate 2'])[:-2]  
+    return_dict['Pass Destination Zone'] = pass_event['Coordinate Zone 2']
+    return_dict['Pass Type'] = pass_event['Coordinate Zones']
+    return_dict['Direct or Indirect'] = pass_event['Detail 1']
+    return_dict['Complete or Incomplete'] = pass_event['Event']
+    return_dict['Next Event'] = next_event['Event']
+    return_dict['Next Event Detail 1'] = next_event['Detail 1']
+    return_dict['Next Event Detail 2'] = next_event['Detail 2']
+    if (next_event['Event'] == 'Shot') | (next_event['Event'] == 'Goal'):
+        return_dict['Next Event xG'] = xg_index_dict[pass_index+1]
+    else:
+        return_dict['Next Event xG'] = 0
+    return return_dict
+
+# Input each pass into above function to aggregate into dataframe
+input_df_just_passes = input_df.loc[(input_df['Event'] == ('Play')) | (input_df['Event'] == ('Incomplete Play'))]
+pass_index_list = input_df_just_passes.index.tolist()
+  
+pass_df = pd.DataFrame(columns = ['Pass Index','Pass Origin', 'Pass Origin Zone',
+                                  'Pass Destination', 'Pass Destination Zone',
+                                  'Pass Type', 'Direct or Indirect', 'Complete or Incomplete',
+                                  'Next Event', 'Next Event Detail 1', 'Next Event Detail 2', 'Next Event xG'])
+
+for index in pass_index_list:
+    pass_df = pass_df.append(pass_index_function(index), ignore_index=True) 
+
+# Map dataframe values to be binary
+pass_df['Pass Completion'] = pass_df['Complete or Incomplete'].map({'Incomplete Play': 0, 'Play': 1})
+pass_df['Direct Pass'] = pass_df['Direct or Indirect'].map({'Direct': 1, 'Indirect': 0})
+pass_df['Next Event Shot'] = pass_df['Next Event'].map({'Faceoff Win': 0, 'Puck Recovery': 0, 'Incomplete Play': 0, 'Play': 0, 'Dump In/Out': 0, 'Zone Entry': 0, 'Shot': 1, 'Takeaway': 0, 'Goal': 1, 'Penalty Taken': 0})
+pass_df['Next Event On Net'] = pass_df['Next Event Detail 2'].map({'On Net': 1, 'Missed': 0, 'Blocked': 0, '': ''})
+pass_df['Next Event Goal'] = pass_df['Next Event'].map({'Faceoff Win': 0, 'Puck Recovery': 0, 'Incomplete Play': 0, 'Play': 0, 'Dump In/Out': 0, 'Zone Entry': 0, 'Shot': 0, 'Takeaway': 0, 'Goal': 1, 'Penalty Taken': 0})
+pass_df = pass_df.loc[pass_df['Pass Origin Zone'] != 'NA']
+pass_df = pass_df.loc[pass_df['Pass Destination Zone'] != 'NA']
+
+# Summarize above passing dataframe
+# Define zone summary function
+def zone_summary_function(zones):
+    zone_summary_dict = {}    
+    temp_df = pass_df.copy()
+    temp_df = temp_df.loc[temp_df['Pass Type'] == zones]
+    zone_summary_dict['Pass Origin'] = zones[0]
+    zone_summary_dict['Pass Destination'] = zones[1]
+    zone_summary_dict['Pass Type'] = zones
+    zone_summary_dict['Pass Attempts'] = len(temp_df)
+    zone_summary_dict['Completed Passes'] = temp_df['Pass Completion'].sum()
+    zone_summary_dict['Pass Completion %'] = zone_summary_dict['Completed Passes'] / zone_summary_dict['Pass Attempts']
+    zone_summary_dict['Next Event Shots'] = temp_df['Next Event Shot'].sum()
+    zone_summary_dict['Next Event Goals'] = temp_df['Next Event Goal'].sum()
+    zone_summary_dict['Next Event SH%'] = (zone_summary_dict['Next Event Goals'] / zone_summary_dict['Next Event Shots']) if zone_summary_dict['Next Event Shots'] > 0 else 0
+    zone_summary_dict['Next Event Total xG'] = temp_df['Next Event xG'].sum()
+    zone_summary_dict['Next Event Avg. xG'] = (zone_summary_dict['Next Event Total xG'] / zone_summary_dict['Next Event Shots']) if zone_summary_dict['Next Event Shots'] > 0 else 0
+    return zone_summary_dict
+
+# Iterate over all 144 unique passing paths/zone combinations
+zone_list = ['A','B','C','D','E','F','G','H','I','J','K','L']
+zone_summary_df = pd.DataFrame(columns = ['Pass Origin', 'Pass Destination', 'Pass Type',
+                                          'Pass Attempts', 'Completed Passes', 'Pass Completion %',
+                                          'Next Event Shots', 'Next Event Goals', 'Next Event SH%',
+                                          'Next Event Total xG', 'Next Event Avg. xG'])
+for z1 in zone_list:
+    for z2 in zone_list:
+        zone_summary_df = zone_summary_df.append(zone_summary_function(z1+z2), ignore_index = True)
+        
+# Calculate baseline shots and average expected goals for each zone
+total_shots_by_zone_overall_dict = {}
+avg_xg_by_zone_overall_dict = {}
+for zone in zone_list:
+    temp_df = shot_df.loc[shot_df['Coordinate Zone'] == zone]
+    total_shots_by_zone_overall_dict[zone] = len(temp_df)
+    avg_xg_by_zone_overall_dict[zone] = temp_df['xG'].sum()/len(temp_df)
+
+# Layer baseline data into zone summary data
+zone_summary_df['Origin Total Shots Overall'] = zone_summary_df['Pass Origin'].map(total_shots_by_zone_overall_dict)
+zone_summary_df['Origin Avg. xG Overall'] = zone_summary_df['Pass Origin'].map(avg_xg_by_zone_overall_dict)
+zone_summary_df['Destination Total Shots Overall'] = zone_summary_df['Pass Destination'].map(total_shots_by_zone_overall_dict)
+zone_summary_df['Destination Avg. xG Overall'] = zone_summary_df['Pass Destination'].map(avg_xg_by_zone_overall_dict)
+zone_summary_df.set_index('Pass Type', inplace=True)
+
+# Aggregate similar passing types - for example a pass from A to C should be grouped with a pass from J to L
+mirror_pass_dict = {'AA':'JJ','AB':'JK','AC':'JL','AD':'JG','AE':'JH','AF':'JI','AG':'JD','AH':'JE','AI':'JF','AJ':'JA','AK':'JB','AL':'JC',
+                    'BA':'KJ','BB':'KK','BC':'KL','BD':'KG','BE':'KH','BF':'KI','BG':'KD','BH':'KE','BI':'KF','BJ':'KA','BK':'KB','BL':'KC',
+                    'CA':'LJ','CB':'LK','CC':'LL','CD':'LG','CE':'LH','CF':'LI','CG':'LD','CH':'LE','CI':'LF','CJ':'LA','CK':'LB','CL':'LC',
+                    'DA':'GJ','DB':'GK','DC':'GL','DD':'GG','DE':'GH','DF':'GI','DG':'GD','DH':'GE','DI':'GF','DJ':'GA','DK':'GB','DL':'GC',
+                    'EA':'HJ','EB':'HK','EC':'HL','ED':'HG','EE':'HH','EF':'HI','EG':'HD','EH':'HE','EI':'HF','EJ':'HA','EK':'HB','EL':'HC',
+                    'FA':'IJ','FB':'IK','FC':'IL','FD':'IG','FE':'IH','FF':'II','FG':'ID','FH':'IE','FI':'IF','FJ':'IA','FK':'IB','FL':'IC',
+                    'GA':'DJ','GB':'DK','GC':'DL','GD':'DG','GE':'DH','GF':'DI','GG':'DD','GH':'DE','GI':'DF','GJ':'DA','GK':'DB','GL':'DC',
+                    'HA':'EJ','HB':'EK','HC':'EL','HD':'EG','HE':'EH','HF':'EI','HG':'ED','HH':'EE','HI':'EF','HJ':'EA','HK':'EB','HL':'EC',
+                    'IA':'FJ','IB':'FK','IC':'FL','ID':'FG','IE':'FH','IF':'FI','IG':'FD','IH':'FE','II':'FF','IJ':'FA','IK':'FB','IL':'FC',
+                    'JA':'AJ','JB':'AK','JC':'AL','JD':'AG','JE':'AH','JF':'AI','JG':'AD','JH':'AE','JI':'AF','JJ':'AA','JK':'AB','JL':'AC',
+                    'KA':'BJ','KB':'BK','KC':'BL','KD':'BG','KE':'BH','KF':'BI','KG':'BD','KH':'BE','KI':'BF','KJ':'BA','KK':'BB','KL':'BC',
+                    'LA':'CJ','LB':'CK','LC':'CL','LD':'CG','LE':'CH','LF':'CI','LG':'CD','LH':'CE','LI':'CF','LJ':'CA','LK':'CB','LL':'CC'}
+
+def mirror_lookup(df, col):
+    temp = zone_summary_df.copy()
+    temp = temp.loc[(temp.index == (df['Pass Origin'] + df['Pass Destination'])) | (temp.index == mirror_pass_dict[(df['Pass Origin'] + df['Pass Destination'])])]
+    return temp[col].sum()
+
+# 'Mirror' refers to both symmetrical pass paths (A to C and J to L, for example)
+zone_summary_df['Mirror Pass Attempts'] = zone_summary_df.apply(lambda x: mirror_lookup(x, 'Pass Attempts'), axis=1)
+zone_summary_df['Mirror Completed Passes'] = zone_summary_df.apply(lambda x: mirror_lookup(x, 'Completed Passes'), axis=1)
+zone_summary_df['Mirror Pass Completion %'] = zone_summary_df['Mirror Completed Passes']/zone_summary_df['Mirror Pass Attempts']
+zone_summary_df['Mirror Next Event Shots'] = zone_summary_df.apply(lambda x: mirror_lookup(x, 'Next Event Shots'), axis=1)
+zone_summary_df['Mirror Next Event Goals'] = zone_summary_df.apply(lambda x: mirror_lookup(x, 'Next Event Goals'), axis=1)
+zone_summary_df['Mirror Next Event SH%'] = zone_summary_df['Mirror Next Event Goals']/zone_summary_df['Mirror Next Event Shots']
+zone_summary_df['Mirror Next Event Total xG'] = zone_summary_df.apply(lambda x: mirror_lookup(x, 'Next Event Total xG'), axis=1)
+zone_summary_df['Mirror Next Event Avg. xG'] = zone_summary_df['Mirror Next Event Total xG']/zone_summary_df['Mirror Next Event Shots']
+zone_summary_df['Mirror Next Event Avg. xG * Completion'] = zone_summary_df['Mirror Next Event Avg. xG']*zone_summary_df['Mirror Pass Completion %']
+zone_summary_df['Pass Type'] = zone_summary_df['Pass Origin'] + zone_summary_df['Pass Destination']
+
+# Sample of code used to calculate further pass danger - below was repeated for each zone in the slot (FIEH)
+def zone_summary_lookup(df, code_col, lookup_col):
+    temp = zone_summary_df.copy()
+    temp = temp.loc[temp['Pass Type'] == df[code_col]]
+    return float(temp[lookup_col])
+
+zone_summary_df['To F Code'] = zone_summary_df['Pass Destination'] + 'F'
+zone_summary_df['To F Mirror Pass Attempts'] = zone_summary_df.apply(lambda x: zone_summary_lookup(x, 'To F Code', 'Mirror Pass Attempts'), axis=1)
+zone_summary_df['To F Mirror Completion %'] = zone_summary_df.apply(lambda x: zone_summary_lookup(x, 'To F Code', 'Mirror Pass Completion %'), axis=1)
+zone_summary_df['To F Mirror Next Event Avg. xG'] = zone_summary_df.apply(lambda x: zone_summary_lookup(x, 'To F Code', 'Mirror Next Event Avg. xG'), axis=1)
+zone_summary_df['To F Mirror Comp & Next Event Avg. xG'] = zone_summary_df['To F Mirror Completion %'] * zone_summary_df['To F Mirror Next Event Avg. xG']
+
+zone_summary_df['Total FIEH Attempts'] = zone_summary_df['To F Mirror Pass Attempts'] + zone_summary_df['To I Mirror Pass Attempts'] + zone_summary_df['To E Mirror Pass Attempts'] + zone_summary_df['To H Mirror Pass Attempts']
+zone_summary_df['F Weight'] = zone_summary_df['To F Mirror Pass Attempts'] / zone_summary_df['Total FIEH Attempts']
+zone_summary_df['Pass Value'] = (zone_summary_df['To F Mirror Comp & Next Event Avg. xG'] * zone_summary_df['F Weight']) + (zone_summary_df['To I Mirror Comp & Next Event Avg. xG'] * zone_summary_df['I Weight']) + (zone_summary_df['To E Mirror Comp & Next Event Avg. xG'] * zone_summary_df['E Weight']) + (zone_summary_df['To H Mirror Comp & Next Event Avg. xG'] * zone_summary_df['H Weight'])
+
+# Sample Graphic: Most Dangerous Passes
+# Establish parameters
+grid_colour, focus_font_color, secondary_font_color = 'darkgray', 'black', 'darkgray'
+grid_line_weight, zone_label_size, content_label_size, title_font_size, axis_font_size, detail_font_size = 5, 64, 12, 24, 16, 12
+
+# Define function to lookup pass information
+def lookup_pass_string(z1, z2, tutorial_binary):    
+    mirror_pass = mirror_pass_dict[z1+z2]
+    df = zone_summary_df.copy()
+    df = df.loc[df['Pass Origin'] == z1]
+    df = df.loc[df['Pass Destination'] == z2]
+    pass_attempts = int(df['Mirror Pass Attempts'])
+    pass_completions = int(df['Mirror Completed Passes'])
+    completion_pct = int(round(float(df['Mirror Completed Passes']/df['Mirror Pass Attempts']), 3) * 100)
+    shots = int(df['Mirror Next Event Shots'])
+    goals = int(df['Mirror Next Event Goals'])
+    avg_xg = round(round(float(df['Mirror Next Event Avg. xG']),3)*100,2)
+    slot_pass_value = round(round(float(df['Pass Value']),3)*100,2)
+    
+    if tutorial_binary == False:
+        return str(z1) + " to " + str(z2) + " / " + str(mirror_pass[0]) + " to " + str(mirror_pass[1]) + "\n\n" + str(avg_xg) + "% Avg. xG \n(" + str(goals) + "G on " + str(shots) + " Shots)\n\n" + str(completion_pct) + "% Comp. (" + str(pass_completions) + "/" + str(pass_attempts) + ")\n\n" + str(slot_pass_value) + "% Slot Pass Danger" 
+    if tutorial_binary == True:
+            return "1)  " + str(z1) + " to " + str(z2) + " / " + str(mirror_pass[0]) + " to " + str(mirror_pass[1]) + "\n\n2)  " + str(avg_xg) + "% Avg. xG \n3)  (" + str(goals) + "G on " + str(shots) + " Shots)\n\n4)  " + str(completion_pct) + "% Comp. (" + str(pass_completions) + "/" + str(pass_attempts) + ")\n\n5)  " + str(slot_pass_value) + "% Slot Pass Danger" 
+
+# Establish coordinates for the center of each zone
+zone_label_cord_dict = {'A': [((x_thresholds[0] + x_thresholds[1])/2), ((y_thresholds[3] + y_thresholds[4])/2)],
+                  'B': [((x_thresholds[1] + x_thresholds[2])/2), ((y_thresholds[3] + y_thresholds[4])/2)],
+                  'C': [((x_thresholds[2] + x_thresholds[3])/2), ((y_thresholds[3] + y_thresholds[4])/2)],
+                  'D': [((x_thresholds[0] + x_thresholds[1])/2), ((y_thresholds[2] + y_thresholds[3])/2)],
+                  'E': [((x_thresholds[1] + x_thresholds[2])/2), ((y_thresholds[2] + y_thresholds[3])/2)],
+                  'F': [((x_thresholds[2] + x_thresholds[3])/2), ((y_thresholds[2] + y_thresholds[3])/2)],
+                  'G': [((x_thresholds[0] + x_thresholds[1])/2), ((y_thresholds[1] + y_thresholds[2])/2)],
+                  'H': [((x_thresholds[1] + x_thresholds[2])/2), ((y_thresholds[1] + y_thresholds[2])/2)],
+                  'I': [((x_thresholds[2] + x_thresholds[3])/2), ((y_thresholds[1] + y_thresholds[2])/2)],
+                  'J': [((x_thresholds[0] + x_thresholds[1])/2), ((y_thresholds[0] + y_thresholds[1])/2)],
+                  'K': [((x_thresholds[1] + x_thresholds[2])/2), ((y_thresholds[0] + y_thresholds[1])/2)],
+                  'L': [((x_thresholds[2] + x_thresholds[3])/2), ((y_thresholds[0] + y_thresholds[1])/2)]}
+                  
+plt.close()
+# Plot formatting
+rink_image = plt.imread("20210204_Blank Rink.jpg")
+fig, ax = plt.subplots()
+ax.imshow(rink_image, extent=[125,200, 0,85])
+fig.set_size_inches(10, 8)
+fig.suptitle('Most Dangerous Passes: Royal Road into Low Slot', fontsize=title_font_size, y=1.05)
+fig.tight_layout()
+ax.set_xlabel('X Coordinate', fontsize=axis_font_size)
+ax.set_ylabel('Y Coordinate', fontsize=axis_font_size)
+
+# Grid
+for x in x_thresholds[1:3]:
+    plt.axvline(x=x, color=grid_colour, linewidth=grid_line_weight)
+for y in y_thresholds[1:4]:
+    plt.axhline(y=y, color=grid_colour, linewidth=grid_line_weight)
+
+# Labels for each zone
+focus_zones = ['A','B','C','D','E','F', 'H','I']
+for zone in zone_list:
+    if zone in focus_zones:
+        ax.text(zone_label_cord_dict[zone][0], zone_label_cord_dict[zone][1], zone, color=focus_font_color, fontsize=zone_label_size, weight='bold', ha='center', va='center', zorder=20)
+    else:
+        ax.text(zone_label_cord_dict[zone][0], zone_label_cord_dict[zone][1], zone, color=secondary_font_color, fontsize=zone_label_size, weight='bold', ha='center', va='center')
+
+# Arrows to represent passing
+plt.arrow(((x_thresholds[1] + x_thresholds[2])/2)-4, ((y_thresholds[3] + y_thresholds[4])/2), 0, -34, head_width=2, linewidth=3, fc='black', fill=True, zorder=15)
+plt.arrow(((x_thresholds[0] + x_thresholds[1])/2)+3, ((y_thresholds[3] + y_thresholds[4])/2)-3, 36, -34, head_width=2, linewidth=3, fc='black', fill=True, zorder=15)
+plt.arrow(((x_thresholds[0] + x_thresholds[1])/2)+3, ((y_thresholds[2] + y_thresholds[3])/2)-2, 36, -18, head_width=2, linewidth=3, fc='black', fill=True, zorder=15)
+plt.arrow(((x_thresholds[1] + x_thresholds[2])/2)+3, ((y_thresholds[3] + y_thresholds[4])/2)-2, 19, -33, head_width=2, linewidth=3, fc='black', fill=True, zorder=15)
+plt.arrow(((x_thresholds[1] + x_thresholds[2])/2), ((y_thresholds[2] + y_thresholds[3])/2)-2, 0, -11, head_width=2, linewidth=3, fc='black', fill=True, zorder=15)
+plt.arrow(((x_thresholds[1] + x_thresholds[2])/2)+4, ((y_thresholds[2] + y_thresholds[3])/2)+2, 14, -15, head_width=2, linewidth=3, fc='black', fill=True, zorder=15)
+plt.arrow(((x_thresholds[2] + x_thresholds[3])/2)+4, ((y_thresholds[3] + y_thresholds[4])/2)-2, 0, -32, head_width=2, linewidth=3, fc='black', fill=True, zorder=15)
+plt.arrow(((x_thresholds[2] + x_thresholds[3])/2)-1.5, ((y_thresholds[3] + y_thresholds[2])/2), 0, -13, head_width=2, linewidth=3, fc='black', fill=True, zorder=15)    
+
+# Rectangles to highlight different zones
+ax.add_patch(patches.Rectangle(
+    (x_thresholds[0]+2, y_thresholds[3]),   # (x,y)
+    x_thresholds[1]-x_thresholds[0]-2,          # width
+    y_thresholds[4]-y_thresholds[3]-1,          # height
+    edgecolor='y',
+    linewidth=10,
+    fill=True,
+    fc=(1,1,0, 0.2),
+    zorder=9))
+
+ax.add_patch(patches.Rectangle(
+    (x_thresholds[1], y_thresholds[3]),   # (x,y)
+    x_thresholds[2]-x_thresholds[1],          # width
+    y_thresholds[4]-y_thresholds[3]-1,          # height
+    edgecolor='y',
+    linewidth=10,
+    fill=True,
+    fc=(1,1,0, 0.2),
+    zorder=9))
+
+ax.add_patch(patches.Rectangle(
+    (x_thresholds[2], y_thresholds[3]),   # (x,y)
+    x_thresholds[3]-x_thresholds[2]-1,          # width
+    y_thresholds[4]-y_thresholds[3]-1,          # height
+    edgecolor='y',
+    linewidth=10,
+    fill=True,
+    fc=(1,1,0, 0.6),
+    zorder=9))
+
+ax.add_patch(patches.Rectangle(
+    (x_thresholds[0]+2, y_thresholds[2]),   # (x,y)
+    x_thresholds[1]-x_thresholds[0]-2,          # width
+    y_thresholds[3]-y_thresholds[2],          # height
+    edgecolor='y',
+    linewidth=10,
+    fill=True,
+    fc=(1,1,0, 0.2),
+    zorder=9))
+
+ax.add_patch(patches.Rectangle(
+    (x_thresholds[1], y_thresholds[2]),   # (x,y)
+    x_thresholds[2]-x_thresholds[1],          # width
+    y_thresholds[3]-y_thresholds[2],          # height
+    edgecolor='y',
+    linewidth=10,
+    fill=True,
+    fc=(1,1,0, 0.6),
+    zorder=9))
+
+ax.add_patch(patches.Rectangle(
+    (x_thresholds[2], y_thresholds[2]),   # (x,y)
+    x_thresholds[3]-x_thresholds[2]-1,          # width
+    y_thresholds[3]-y_thresholds[2],          # height
+    edgecolor='y',
+    linewidth=10,
+    fill=True,
+    fc=(1,1,0, 0.9),
+    zorder=9))
+    
+ ax.add_patch(patches.Rectangle(
+    (x_thresholds[1], y_thresholds[1]),   # (x,y)
+    x_thresholds[2]-x_thresholds[1],          # width
+    y_thresholds[2]-y_thresholds[1],          # height
+    edgecolor='g',
+    linewidth=10,
+    fill=True,
+    fc=(0,1,0, 0.5),
+    zorder=14
+    ))
+
+ax.add_patch(patches.Rectangle(
+    (x_thresholds[2], y_thresholds[1]),   # (x,y)
+    x_thresholds[3]-x_thresholds[2]-1,          # width
+    y_thresholds[2]-y_thresholds[1],          # height
+    edgecolor='g',
+    linewidth=10,
+    fill=True,
+    fc=(0,1,0, 0.9),
+    zorder=14
+    ))
+
+# Text boxes to show passing information
+t = ax.text(215, 84, lookup_pass_string('A', 'I', True), fontsize=detail_font_size, ha='center',va='top',weight='bold',color='black', zorder=11)
+t.set_bbox(dict(facecolor='palegoldenrod', alpha=0.4, edgecolor='black'))
+t = ax.text(245, 84, lookup_pass_string('B', 'I', True), fontsize=detail_font_size, ha='center',va='top',weight='bold',color='black', zorder=11)
+t.set_bbox(dict(facecolor='palegoldenrod', alpha=0.4, edgecolor='black'))
+t = ax.text(275, 84, lookup_pass_string('C', 'I', True), fontsize=detail_font_size, ha='center',va='top',weight='bold',color='black', zorder=11)
+t.set_bbox(dict(facecolor='gold', alpha=0.4, edgecolor='black'))
+t = ax.text(215, 63, lookup_pass_string('D', 'I', True), fontsize=detail_font_size, ha='center',va='top',weight='bold',color='black', zorder=11)
+t.set_bbox(dict(facecolor='palegoldenrod', alpha=0.4, edgecolor='black'))
+t = ax.text(245, 63, lookup_pass_string('E', 'I', True), fontsize=detail_font_size, ha='center',va='top',weight='bold',color='black', zorder=11)
+t.set_bbox(dict(facecolor='gold', alpha=0.4, edgecolor='black'))
+t = ax.text(275, 63, lookup_pass_string('F', 'I', True), fontsize=detail_font_size, ha='center',va='top',weight='bold',color='black', zorder=11)
+t.set_bbox(dict(facecolor='darkgoldenrod', alpha=0.4, edgecolor='black'))
+t = ax.text(229, 42, lookup_pass_string('B', 'H', True), fontsize=detail_font_size, ha='center',va='top',weight='bold',color='black', zorder=11)
+t.set_bbox(dict(facecolor='palegoldenrod', alpha=0.4, edgecolor='black'))
+t = ax.text(260, 42, lookup_pass_string('E', 'H', True), fontsize=detail_font_size, ha='center',va='top',weight='bold',color='black', zorder=11)
+t.set_bbox(dict(facecolor='palegoldenrod', alpha=0.4, edgecolor='black'))
+
+# Miscellaneous text boxes for explanation 
+explanation_str = "1)  Pass Type (Start & End Zones)*\n\n" + "2)  Average Expected Goals of Shots After Pass\n" + "3)  Total Actual Goals and Shots After Pass\n\n" + "4)  Pass Completion % (Successes/Attempts)\n\n" + "5)  Danger of Follow-Up Passes Into Slot (defined in appendix) "  
+t = ax.text(203, -7, explanation_str, fontsize=detail_font_size+2, ha='left',va='bottom',weight='bold',color='white', zorder=12)
+t.set_bbox(dict(facecolor='black', alpha=0.8, edgecolor='black', linewidth=5))
+t = ax.text(203, 14.5, 'HOW TO READ THESE CHARTS', fontsize=detail_font_size+5, ha='left',va='bottom',weight='bold',color='black', zorder=12)
+t.set_bbox(dict(facecolor='white', alpha=0, edgecolor='w'))
+t = ax.text(203, -12, '*Pass types include each arrow shown & its mirror counterpart (e.g., A→I & J→F)', fontsize=detail_font_size, ha='left',va='bottom',color='black', zorder=12)
+t.set_bbox(dict(facecolor='white', alpha=0.8, edgecolor='w'))
+
+plt.show()
